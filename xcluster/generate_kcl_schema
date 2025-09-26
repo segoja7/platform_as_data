@@ -1,0 +1,494 @@
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from collections import deque
+import yaml
+import argparse
+
+# Constantes de formato
+INDENT = "    "
+
+# --- INICIO: Lógica para el mapa de diagramas ---
+
+DIAGRAM_MAP_FILE = "diagram_map.yaml"
+
+ICON_HEURISTICS = {
+    # Keywords en 'kind' o 'group'
+    "cluster": "diagrams.k8s.infra.Master",
+    "database": "diagrams.generic.database.SQL",
+    "sql": "diagrams.generic.database.SQL",
+    "rds": "diagrams.aws.database.RDS",
+    "cache": "diagrams.aws.database.ElastiCache",
+    "redis": "diagrams.aws.database.ElastiCache",
+    "bucket": "diagrams.aws.storage.S3",
+    "storage": "diagrams.aws.storage.S3",
+    "vpc": "diagrams.aws.network.VPC",
+    "subnet": "diagrams.aws.network.Subnet",
+    "network": "diagrams.aws.network.VPC",
+    "gateway": "diagrams.aws.network.InternetGateway",
+    "route": "diagrams.aws.network.RouteTable",
+    "securitygroup": "diagrams.aws.security.SecurityGroup",
+    "iam": "diagrams.aws.security.IAM",
+    "role": "diagrams.aws.security.IAMRole",
+    "policy": "diagrams.aws.security.IAMPermissions",
+    "eks": "diagrams.aws.compute.EKS",
+    "ec2": "diagrams.aws.compute.EC2",
+    "vm": "diagrams.onprem.compute.VM",
+    "deployment": "diagrams.k8s.compute.Deploy",
+    "service": "diagrams.k8s.network.Svc",
+    "pod": "diagrams.k8s.compute.Pod",
+    "ingress": "diagrams.k8s.network.Ing",
+    "pvc": "diagrams.k8s.storage.Pvc",
+    "backup": "diagrams.aws.storage.Backup",
+    "restore": "diagrams.aws.storage.EFS",
+}
+
+def guess_icon_from_crd_info(kind, group):
+    """Adivina un icono de diagrama basado en palabras clave en kind y group."""
+    kind_lower = kind.lower()
+    group_lower = group.lower()
+    
+    # Buscar en kind
+    for keyword, icon in ICON_HEURISTICS.items():
+        if keyword in kind_lower:
+            return icon
+            
+    # Buscar en group
+    for keyword, icon in ICON_HEURISTICS.items():
+        if keyword in group_lower:
+            return icon
+            
+    return "diagrams.generic.blank.Blank" # Icono por defecto
+
+def update_diagram_map(crd_kind, crd_group, crd_version):
+    """
+    Actualiza el fichero diagram_map.yaml con un nuevo CRD y su grupo de cluster.
+    Lo crea si no existe.
+    """
+    map_key = f"{crd_kind}.{crd_group}/{crd_version}"
+    print(f"-> Actualizando mapa de diagramas para: {map_key}")
+
+    data = {"node_mappings": {}, "cluster_mappings": []}
+    if os.path.exists(DIAGRAM_MAP_FILE):
+        try:
+            with open(DIAGRAM_MAP_FILE, 'r') as f:
+                loaded_data = yaml.safe_load(f)
+                if loaded_data:
+                    data = loaded_data
+        except yaml.YAMLError as e:
+            print(f"AVISO: No se pudo leer {DIAGRAM_MAP_FILE}, se creará uno nuevo. Error: {e}", file=sys.stderr)
+
+    # --- 1. Actualizar Node Mappings ---
+    if "node_mappings" not in data or data["node_mappings"] is None:
+        data["node_mappings"] = {}
+
+    if map_key not in data["node_mappings"]:
+        guessed_icon = guess_icon_from_crd_info(crd_kind, crd_group)
+        print(f"  -> Clave de nodo no encontrada. Adivinando icono: {guessed_icon}")
+        data["node_mappings"][map_key] = guessed_icon
+    else:
+        print(f"  -> La clave de nodo ya existe. No se modifica.")
+
+    # --- 2. Actualizar Cluster Mappings ---
+    if "cluster_mappings" not in data or data["cluster_mappings"] is None:
+        data["cluster_mappings"] = []
+
+    group_already_mapped = False
+    for mapping in data["cluster_mappings"]:
+        for prefix in mapping.get("apiVersions", []):
+            if crd_group.startswith(prefix):
+                group_already_mapped = True
+                break
+        if group_already_mapped:
+            break
+
+    if not group_already_mapped:
+        print(f"  -> Grupo API '{crd_group}' no mapeado. Creando nueva regla de cluster...")
+        # Generar un nombre amigable para el cluster
+        name_parts = [p.upper() for p in crd_group.split('.') if p not in ['io', 'org', 'com', 'crossplane']]
+        cluster_name = ' '.join(name_parts)
+        if not cluster_name:
+            cluster_name = crd_group.title()
+
+        new_mapping = {"cluster_name": cluster_name, "apiVersions": [crd_group]}
+        data["cluster_mappings"].append(new_mapping)
+        print(f"    -> Añadida regla de cluster '{cluster_name}' para el grupo '{crd_group}'")
+    else:
+        print(f"  -> El grupo API ya pertenece a un cluster. No se modifica.")
+
+    # --- 3. Escribir el fichero ---
+    try:
+        with open(DIAGRAM_MAP_FILE, 'w') as f:
+            yaml.dump(data, f, sort_keys=False, indent=2)
+        print(f"-> {DIAGRAM_MAP_FILE} actualizado con éxito.")
+    except Exception as e:
+        print(f"Error: No se pudo escribir en {DIAGRAM_MAP_FILE}. Error: {e}", file=sys.stderr)
+
+# --- FIN: Lógica para el mapa de diagramas ---
+
+def import_from_modules_directory(modules_dir="modules"):
+    """
+    Escanea el directorio de módulos, analiza los schemas KCL y actualiza el mapa de diagramas.
+    """
+    print(f"-> Iniciando importación desde el directorio: {modules_dir}")
+    if not os.path.isdir(modules_dir):
+        print(f"Error: El directorio '{modules_dir}' no existe.", file=sys.stderr)
+        sys.exit(1)
+
+    found_count = 0
+    for root, _, files in os.walk(modules_dir):
+        for file in files:
+            if file.endswith(".k"):
+                file_path = os.path.join(root, file)
+                print(f"  -> Procesando: {file_path}")
+                try:
+                    parts = file_path.split(os.sep)
+                    
+                    try:
+                        modules_index = parts.index('modules')
+                    except ValueError:
+                        print(f"AVISO: No se pudo encontrar el directorio 'modules' en la ruta: {file_path}")
+                        continue
+
+                    if len(parts) > modules_index + 2:
+                        group_path = parts[modules_index + 1]
+                        version = parts[modules_index + 2]
+                        filename = parts[modules_index + 3]
+
+                        kind = filename.split('_')[-1].replace('.k', '')
+                        group = group_path.replace('_', '.')
+                        
+                        update_diagram_map(kind, group, version)
+                        found_count += 1
+                    else:
+                        print(f"AVISO: La ruta del fichero no tiene la estructura esperada: {file_path}")
+
+                except Exception as e:
+                    print(f"AVISO: No se pudo procesar el fichero {file_path}. Error: {e}", file=sys.stderr)
+    
+    if found_count > 0:
+        print(f"\n✅ Importación completada. Se procesaron {found_count} ficheros de schema.")
+    else:
+        print("\nNo se encontraron ficheros de schema KCL en el directorio 'modules'.")
+
+def to_pascal_case(name):
+    """Convierte un string a PascalCase."""
+    return name.replace("_", " ").title().replace(" ", "")
+
+class KCLSchemaGenerator:
+    """
+    Genera un schema KCL a partir de una definición de CRD en formato JSON OpenAPI.
+    """
+
+    def __init__(self, crd_name):
+        self.crd_name = crd_name
+        self.crd_json = None
+        self.schemas_to_generate = {}
+        self.generated_schemas = set()
+
+    def _get_crd_json(self):
+        """Obtiene la definición del CRD desde Kubernetes."""
+        print(f"-> Extrayendo definición para CRD: {self.crd_name}...")
+        try:
+            result = subprocess.run(
+                ["kubectl", "get", "crd", self.crd_name, "-o", "json"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.crd_json = json.loads(result.stdout)
+            print("-> Extracción completada.")
+        except subprocess.CalledProcessError as e:
+            print(f"Error: No se pudo obtener el CRD '{self.crd_name}'.", file=sys.stderr)
+            print(f"Stderr: {e.stderr}", file=sys.stderr)
+            sys.exit(1)
+        except json.JSONDecodeError:
+            print(f"Error: La salida de kubectl no es un JSON válido.", file=sys.stderr)
+            sys.exit(1)
+
+    def _find_all_schemas(self, schema_name, schema_def):
+        """
+        Encuentra recursivamente todos los schemas anidados que necesitan ser generados.
+        """
+        if not schema_def or schema_name in self.schemas_to_generate:
+            return
+
+        self.schemas_to_generate[schema_name] = schema_def
+
+        properties = schema_def.get("properties", {})
+        for prop_name, prop_def in properties.items():
+            prop_type = prop_def.get("type")
+
+            if prop_type == "object" and "properties" in prop_def:
+                nested_schema_name = to_pascal_case(f"{schema_name}_{prop_name}")
+                self._find_all_schemas(nested_schema_name, prop_def)
+            elif prop_type == "array" and prop_def.get("items", {}).get("type") == "object":
+                items_def = prop_def.get("items", {})
+                if "properties" in items_def:
+                    nested_schema_name = to_pascal_case(f"{schema_name}_{prop_name}Item")
+                    self._find_all_schemas(nested_schema_name, items_def)
+
+    def _get_kcl_type(self, prop_name, prop_def, parent_schema_name):
+        """Mapea un tipo de propiedad JSON a un tipo KCL."""
+        prop_type = prop_def.get("type")
+        if prop_type == "string":
+            if "enum" in prop_def:
+                return " | ".join([f'\'{e}\' ' for e in prop_def["enum"]])
+            return "str"
+        if prop_type == "boolean":
+            return "bool"
+        if prop_type == "integer":
+            return "int"
+        if prop_type == "number":
+            return "float"
+        if prop_type == "array":
+            items = prop_def.get("items", {})
+            item_type = self._get_kcl_type(f"{prop_name}Item", items, parent_schema_name)
+            return f"[{item_type}]"
+        if prop_type == "object":
+            if "properties" in prop_def:
+                return to_pascal_case(f"{parent_schema_name}_{prop_name}")
+            if "additionalProperties" in prop_def:
+                val_type = self._get_kcl_type(
+                    f"{prop_name}Value", prop_def["additionalProperties"], parent_schema_name
+                )
+                return f"{{str:{val_type}}}"
+        if "$ref" in prop_def:
+            ref_name = prop_def["$ref"].split("/")[-1]
+            if "io.k8s.apimachinery.pkg.apis.meta.v1" in prop_def["$ref"]:
+                return f'''meta.{ref_name.split(".")[-1]}'''
+            return to_pascal_case(ref_name.split(".")[-1])
+
+        return "any"
+
+    def _generate_docstring(self, schema_name, schema_def):
+        """Genera el bloque de docstring para un schema."""
+        description = textwrap.dedent(schema_def.get("description", f"{schema_name} schema.")).strip()
+        
+        lines = [
+            '''"''', 
+            description,
+            ''
+        ]
+        
+        properties = schema_def.get("properties", {})
+        if properties:
+            lines.append('Attributes')
+            lines.append('----------')
+            required_fields = schema_def.get("required", [])
+
+            for prop_name, prop_def in properties.items():
+                kcl_type = self._get_kcl_type(prop_name, prop_def, schema_name)
+                req_opt = "required" if prop_name in required_fields else "optional"
+                
+                attr_line = f"{prop_name} : {kcl_type}, {req_opt}"
+                
+                prop_desc = textwrap.dedent(prop_def.get("description", "No description available.")).strip()
+                indented_desc = textwrap.indent(prop_desc, INDENT)
+                
+                lines.append(attr_line + "\n" + indented_desc)
+        
+        lines.append('''"''')
+        return "\n".join(lines)
+
+    def _generate_single_schema(self, schema_name, schema_def, is_root=False, group=None, version=None, kind=None):
+        """Genera el código KCL para un único schema."""
+        if schema_name in self.generated_schemas:
+            return ""
+        
+        docstring = self._generate_docstring(schema_name, schema_def)
+        
+        attributes = []
+        properties = schema_def.get("properties", {})
+        required_fields = schema_def.get("required", [])
+
+        for prop_name, prop_def in properties.items():
+            kcl_type = self._get_kcl_type(prop_name, prop_def, schema_name)
+            
+            if is_root and prop_name in ["apiVersion", "kind"]:
+                is_required = True
+            else:
+                is_required = prop_name in required_fields
+            
+            attr_name = prop_name
+            
+            attr_line = f"{attr_name}{'' if is_required else '?'} : {kcl_type}"
+
+            if is_root and prop_name == "apiVersion":
+                api_version_val = f"{group}/{version}"
+                attr_line += f' = "{api_version_val}"'
+            elif is_root and prop_name == "kind":
+                attr_line += f' = "{kind}"'
+            
+            attributes.append(attr_line)
+
+        schema_body = textwrap.indent("\n".join(attributes), INDENT)
+        self.generated_schemas.add(schema_name)
+        
+        return "schema " + schema_name + ":\n" + textwrap.indent(docstring, INDENT) + "\n" + schema_body
+
+    def generate(self, base_dir=""):
+        """Orquesta la generación del archivo KCL completo."""
+        self._get_crd_json()
+
+        try:
+            crd_spec = self.crd_json["spec"]
+            gvk_info = crd_spec["versions"][0]
+            for v in crd_spec["versions"]:
+                if v.get("served", True):
+                    gvk_info = v
+                    break
+            
+            spec_schema = gvk_info["schema"]["openAPIV3Schema"]
+            group = crd_spec["group"]
+            version = gvk_info["name"]
+            kind = crd_spec["names"]["kind"]
+        except KeyError as e:
+            print(f"Error: El JSON del CRD no tiene la estructura esperada. Falta la clave: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        print("-> Analizando schemas y dependencias...")
+        self._find_all_schemas(to_pascal_case(kind), spec_schema)
+        
+        print("-> Generando código KCL...")
+        schema_names_ordered = list(self.schemas_to_generate.keys())
+
+        all_kcl_code = []
+        for i, schema_name in enumerate(schema_names_ordered):
+            schema_def = self.schemas_to_generate[schema_name]
+            is_root = (i == 0)
+            all_kcl_code.append(self._generate_single_schema(
+                schema_name, schema_def, is_root=is_root, 
+                group=group, version=version, kind=kind
+            ))
+
+        file_header = textwrap.dedent('''
+            """
+            This file was generated automatically and is intended to be a KCL Schema
+            schema representation of a Kubernetes CRD.
+
+            It is based on the provided OpenAPI v2 JSON schema.
+
+            DO NOT EDIT MANUALLY.
+            """
+        ''').strip()
+        
+        file_content = f"{file_header}\n\n" + "\n\n".join(all_kcl_code)
+
+        group_path = group.replace(".", "_")
+        filename = f"{group_path}_{version}_{kind}.k"
+        output_dir = os.path.join(base_dir, "modules", group_path, version) if base_dir else os.path.join("modules", group_path, version)
+        output_path = os.path.join(output_dir, filename)
+
+        print(f"-> Creando directorio: {output_dir}")
+        os.makedirs(output_dir, exist_ok=True)
+
+        print(f"-> Guardando schema en: {output_path}")
+        with open(output_path, "w") as f:
+            f.write(file_content)
+
+        print("\n¡Éxito! El schema KCL ha sido generado.")
+        print(f"Archivo: {output_path}")
+
+        # --- AÑADIDO: Actualizar el mapa de diagramas ---
+        update_diagram_map(kind, group, version)
+
+def list_available_crds():
+    """Lista todos los CRDs disponibles en el cluster."""
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "crd", "--no-headers", "-o", "custom-columns=NAME:.metadata.name"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        crds = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+        return sorted(crds)
+    except subprocess.CalledProcessError as e:
+        print(f"Error: No se pudieron listar los CRDs.", file=sys.stderr)
+        print(f"Stderr: {e.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+def interactive_crd_selection():
+    """Permite seleccionar un CRD de forma interactiva."""
+    print("Listando CRDs disponibles...")
+    all_crds = list_available_crds()
+    
+    if not all_crds:
+        print("No se encontraron CRDs en el cluster.")
+        sys.exit(1)
+    
+    print(f"\nEncontrados {len(all_crds)} CRDs.")
+    print("Escribe para filtrar, o presiona Enter para ver todos:")
+    
+    while True:
+        filter_text = input("\nFiltro (o 'q' para salir): ").strip()
+        
+        if filter_text.lower() == 'q':
+            print("Saliendo...")
+            sys.exit(0)
+        
+        # Filtrar CRDs
+        if filter_text:
+            filtered_crds = [crd for crd in all_crds if filter_text.lower() in crd.lower()]
+        else:
+            filtered_crds = all_crds
+        
+        if not filtered_crds:
+            print("No se encontraron CRDs que coincidan con el filtro.")
+            continue
+        
+        # Mostrar opciones
+        print(f"\nCRDs encontrados ({len(filtered_crds)}):")
+        for i, crd in enumerate(filtered_crds[:20], 1):  # Mostrar máximo 20
+            print(f"{i:2d}. {crd}")
+        
+        if len(filtered_crds) > 20:
+            print(f"... y {len(filtered_crds) - 20} más. Refina tu filtro.")
+        
+        # Selección
+        try:
+            selection = input(f"\nSelecciona un número (1-{min(20, len(filtered_crds))}): ").strip()
+            if selection:
+                index = int(selection) - 1
+                if 0 <= index < min(20, len(filtered_crds)):
+                    return filtered_crds[index]
+                else:
+                    print("Número fuera de rango.")
+        except ValueError:
+            print("Por favor ingresa un número válido.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Genera schemas KCL desde CRDs y/o importa schemas existentes al mapa de diagramas.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        "crd_name", 
+        nargs='?', 
+        default=None,
+        help="Nombre del CRD a procesar (ej: 'clusters.eks.aws.crossplane.io'). Si no se especifica, entra en modo interactivo o de importación."
+    )
+    parser.add_argument(
+        "--import-modules",
+        action="store_true",
+        help="Activa el modo de importación para escanear el directorio 'modules' y poblar el mapa de diagramas."
+    )
+
+    args = parser.parse_args()
+
+    if args.import_modules:
+        # Modo de importación
+        import_from_modules_directory()
+    elif args.crd_name:
+        # Modo con parámetro de CRD
+        generator = KCLSchemaGenerator(crd_name=args.crd_name)
+        generator.generate()
+    else:
+        # Modo interactivo
+        crd_name_arg = interactive_crd_selection()
+        if crd_name_arg:
+            generator = KCLSchemaGenerator(crd_name=crd_name_arg)
+            generator.generate()

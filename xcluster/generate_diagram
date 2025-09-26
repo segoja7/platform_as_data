@@ -1,0 +1,194 @@
+# Motor de Diagramas Relacional y Agnóstico
+import argparse
+import importlib
+import json
+import os
+import subprocess
+import sys
+import yaml
+from diagrams import Diagram, Cluster, Edge
+
+# --- Bloque de Ayudantes (Helpers) ---
+
+CLASS_CACHE = {}
+
+def get_class_from_string(class_path):
+    """Importa y devuelve dinámicamente una clase desde un string."""
+    if class_path in CLASS_CACHE:
+        return CLASS_CACHE[class_path]
+    try:
+        module_name, class_name = class_path.rsplit(".", 1)
+        module = importlib.import_module(module_name)
+        cls = getattr(module, class_name)
+        CLASS_CACHE[class_path] = cls
+        return cls
+    except (ImportError, AttributeError) as e:
+        print(f"AVISO: No se pudo importar la clase '{class_path}'. Error: {e}", file=sys.stderr)
+        return None
+
+def get_value_from_path(d, path):
+    """Obtiene un valor de un diccionario anidado usando una ruta de puntos."""
+    keys = path.split('.')
+    current = d
+    for key in keys:
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+        # Nota: Esta versión simple no maneja índices de listas (ej. spec.rules[0]).
+        else:
+            return None
+    return current
+
+def parse_kcl_to_resources(kcl_file_path, values_file_path):
+    """Ejecuta KCL y devuelve una lista de recursos."""
+    print(f"-> Usando el fichero de valores: {values_file_path}")
+    try:
+        with open(values_file_path, 'r') as stream:
+            values_data = yaml.safe_load(stream)
+        params_obj = {"oxr": values_data}
+        params_str = json.dumps(params_obj)
+        print(f"-> Ejecutando KCL con 'kcl -S items': {kcl_file_path}")
+        result = subprocess.run(
+            ["kcl", kcl_file_path, "-S", "items", "-D", f"params={params_str}"],
+            capture_output=True, text=True, check=True,
+        )
+        resources = list(yaml.safe_load_all(result.stdout))
+        print(f"-> KCL ejecutado y parseado con éxito. {len(resources)} recursos encontrados.")
+        return [r for r in resources if r is not None]
+    except Exception as e:
+        print(f"Error durante el parseo de KCL: {e}", file=sys.stderr)
+        return None
+
+# --- Motor Principal del Diagrama ---
+
+def generate_relational_diagram(resources, diagram_map, output_filename):
+    if not resources:
+        print("No se encontraron recursos para generar el diagrama.")
+        return
+
+    # Cargar configuraciones del mapa
+    node_mappings = diagram_map.get("node_mappings", {})
+    cluster_mappings = diagram_map.get("cluster_mappings", [])
+    connection_rules = diagram_map.get("connection_rules", [])
+    default_icon = node_mappings.get("default", "diagrams.generic.blank.Blank")
+
+    print("-> Iniciando generación de diagrama relacional...")
+    with Diagram("Arquitectura Relacional Generada", show=False, filename=output_filename, graph_attr={"splines": "true"}):
+        instantiated_nodes = {}
+        resource_map = {}
+
+        # --- Fase 1: Crear todos los nodos ---
+        print("  -> Fase 1: Creando nodos...")
+        for r in resources:
+            kind = r.get("kind")
+            api_version = r.get("apiVersion")
+            name = r.get("metadata", {}).get("name", "unnamed")
+            uid = f"{kind}/{name}"
+            map_key = f"{kind}.{api_version}"
+            resource_map[uid] = r
+
+            icon_path = node_mappings.get(map_key, default_icon)
+            if map_key not in node_mappings:
+                print(f"  AVISO: Recurso no mapeado '{map_key}'. Usando icono por defecto.")
+            
+            NodeClass = get_class_from_string(icon_path)
+            if NodeClass:
+                # La instanciación real ocurre dentro de los clusters
+                pass
+
+        # Agrupar nodos por cluster
+        clustered_nodes_defs = {}
+        unclustered_nodes_uids = list(resource_map.keys())
+
+        for cmap in cluster_mappings:
+            cluster_name = cmap.get("cluster_name")
+            if not cluster_name: continue
+            clustered_nodes_defs[cluster_name] = []
+            for uid in list(unclustered_nodes_uids): # Iterar sobre una copia
+                r = resource_map[uid]
+                api_version = r.get("apiVersion")
+                if not api_version: continue
+                for api_prefix in cmap.get("apiVersions", []):
+                    if api_version.startswith(api_prefix):
+                        clustered_nodes_defs[cluster_name].append(uid)
+                        unclustered_nodes_uids.remove(uid)
+                        break
+
+        # Instanciar nodos dentro de su cluster
+        for cluster_name, uids in clustered_nodes_defs.items():
+            with Cluster(cluster_name):
+                for uid in uids:
+                    r = resource_map[uid]
+                    name = r["metadata"]["name"]
+                    map_key = f'{r["kind"]}.{r["apiVersion"]}'
+                    icon_path = node_mappings.get(map_key, default_icon)
+                    NodeClass = get_class_from_string(icon_path)
+                    if NodeClass:
+                        instantiated_nodes[uid] = NodeClass(name)
+
+        for uid in unclustered_nodes_uids:
+            r = resource_map[uid]
+            name = r["metadata"]["name"]
+            map_key = f'{r["kind"]}.{r["apiVersion"]}'
+            icon_path = node_mappings.get(map_key, default_icon)
+            NodeClass = get_class_from_string(icon_path)
+            if NodeClass:
+                instantiated_nodes[uid] = NodeClass(name)
+
+        # --- Fase 2: Crear Conexiones ---
+        print("  -> Fase 2: Creando conexiones...")
+        for source_uid, source_r in resource_map.items():
+            source_type = f'{source_r.get("kind")}.{source_r.get("apiVersion")}'
+            for rule in connection_rules:
+                if rule.get("source") == source_type:
+                    target_name = get_value_from_path(source_r, rule["link_on"]["source_field"])
+                    if not target_name: continue
+
+                    # Encontrar el recurso y nodo destino
+                    for target_uid, target_r in resource_map.items():
+                        if get_value_from_path(target_r, rule["link_on"]["target_field"]) == target_name:
+                            source_node = instantiated_nodes.get(source_uid)
+                            target_node = instantiated_nodes.get(target_uid)
+                            edge_attrs = rule.get("edge", {})
+                            
+                            if source_node and target_node:
+                                print(f"    -> Conectando {source_uid} -> {target_uid}")
+                                direction = edge_attrs.get("direction", "forward")
+                                edge = Edge(**{k: v for k, v in edge_attrs.items() if k != 'direction'})
+                                if direction == 'backward':
+                                    source_node << edge << target_node
+                                else:
+                                    source_node >> edge >> target_node
+                            break
+
+    print(f"\n✅ ¡Diagrama relacional guardado en {output_filename}.png!")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Genera un diagrama de arquitectura relacional y agnóstico desde ficheros KCL.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument("input_file", help="Ruta al fichero KCL principal (ej. main.k).")
+    parser.add_argument("--values-file", required=True, help="Ruta al fichero YAML con los valores de entrada.")
+    parser.add_argument("-o", "--output-filename", default="architecture", help="Nombre del fichero de imagen de salida (sin extensión).")
+    parser.add_argument("--map-file", default="diagram_map.yaml", help="Ruta al fichero de mapeo de diagrama.")
+    args = parser.parse_args()
+
+    try:
+        with open(args.map_file, 'r') as f:
+            diagram_map = yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"Error: Fichero de mapeo '{args.map_file}' no encontrado.", file=sys.stderr)
+        print("Ejecuta primero el script 'generate_kcl_schema' para crearlo.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error al leer el fichero de mapeo: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    resources = parse_kcl_to_resources(args.input_file, args.values_file)
+    if resources is None:
+        sys.exit(1)
+
+    generate_relational_diagram(resources, diagram_map, args.output_filename)
+
+if __name__ == "__main__":
+    main()

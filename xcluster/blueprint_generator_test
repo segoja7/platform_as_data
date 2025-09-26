@@ -1,0 +1,431 @@
+# blueprint_generator_final.py
+import sys
+import re
+import argparse
+from pathlib import Path
+
+def generate_blueprint_from_schema(detailed_kcl_schema: str, input_filepath: Path) -> (str, str, str):
+    """
+    Toma un schema KCL detallado y genera un Blueprint de alto nivel,
+    con la sintaxis correcta para campos opcionales y sin duplicados.
+    """
+    
+    schemas = {match.group(1): match.group(2) for match in re.finditer(r"schema\s+(\w+):\s*((?:.|\n)*?)(?=\n\nschema|\Z)", detailed_kcl_schema)}
+    if not schemas: return "# ERROR: No schemas found.", None, None
+
+    main_schema_name, main_schema_text = (None, "")
+    for name, body in schemas.items():
+        if all(re.search(r"^\s*" + attr + r"\s*\??\s*:", body, re.MULTILINE | re.IGNORECASE) for attr in ["apiVersion", "kind", "metadata", "spec"]):
+            main_schema_name, main_schema_text = name, body
+            break
+    if not main_schema_name: return "# ERROR: Could not identify a main schema.", None, None
+
+    blueprint_name = f"{main_schema_name}Blueprint"
+    
+    spec_match = re.search(r"^\s*spec\s*:\s*(\w+)", main_schema_text, re.MULTILINE | re.IGNORECASE)
+    if not spec_match: return f"# ERROR: Could not find 'spec' in '{main_schema_name}'.", None, None
+    
+    spec_schema_name = spec_match.group(1)
+    if spec_schema_name not in schemas: return f"# ERROR: Schema '{spec_schema_name}' not found.", None, None
+    
+    spec_schema_text = schemas[spec_schema_name]
+    for_provider_match = re.search(r"^\s*forProvider\s*:\s*(\w+)", spec_schema_text, re.MULTILINE | re.IGNORECASE)
+    
+    params_from_schema = {}
+    target_schema_body = ""
+    is_crossplane_resource = False
+
+    # Primero extraer campos del spec principal
+    spec_params = {}
+    
+    # Extraer todos los campos del spec (no solo forProvider)
+    docstring_fields = re.findall(r"^\s*([a-zA-Z0-9_]+)\s*:\s*([^,]+),\s*(required|optional)", spec_schema_text, re.MULTILINE)
+    
+    for attr_name, attr_type, requirement in docstring_fields:
+        # Skip forProvider ya que lo procesaremos por separado
+        if attr_name == "forProvider":
+            continue
+        # Skip providerConfigRef - lo manejaremos con _providerConfig
+        if attr_name == "providerConfigRef":
+            continue
+            
+        attr_type = attr_type.strip()
+        
+        # Skip campos inválidos o de metadatos
+        if (attr_name in ["Deprecated", "Default", "apiVersion", "kind", "metadata", "status", "true", "Constraints", "Maximum"] or 
+            attr_type in ["AWS", "Maximum of 1000 resources"] or
+            attr_name.startswith("_")):
+            continue
+            
+        is_required = (requirement == "required")
+        param_name = f"_{attr_name}"
+        spec_params[param_name] = {"type": attr_type, "required": is_required}
+
+    # Fallback: buscar campos directamente en el cuerpo del spec schema
+    code_only_body = re.sub(r'"""(.|\n)*?"""', '', spec_schema_text)
+    body_fields = re.findall(r"^\s*([a-zA-Z0-9_]+)(\??)\s*:\s*(.+)", code_only_body, re.MULTILINE)
+    for attr_name, optional_marker, attr_type in body_fields:
+        # Skip forProvider ya que lo procesaremos por separado
+        if attr_name == "forProvider":
+            continue
+        # Skip providerConfigRef - lo manejaremos con _providerConfig
+        if attr_name == "providerConfigRef":
+            continue
+            
+        param_name = f"_{attr_name}"
+        # No sobreescribir si ya fue encontrado en el docstring
+        if param_name in spec_params:
+            continue
+
+        attr_type = attr_type.strip().split(" ")[0]
+        if attr_type.startswith("#"):
+            continue
+
+        if (attr_name in ["Deprecated", "Default", "apiVersion", "kind", "metadata", "status"] or 
+            attr_type in ["AWS"] or
+            attr_name.startswith("_")):
+            continue
+
+        is_required = not bool(optional_marker)
+        if attr_type:
+            spec_params[param_name] = {"type": attr_type, "required": is_required}
+
+    # Ahora procesar forProvider si existe
+    if for_provider_match:
+        is_crossplane_resource = True
+        for_provider_schema_name = for_provider_match.group(1)
+        if for_provider_schema_name in schemas: 
+            target_schema_body = schemas[for_provider_schema_name]
+    else:
+        target_schema_body = spec_schema_text
+
+    desirable_optionals = ["region", "availabilityZone", "vpcId", "vpcIdRef", "vpcIdSelector", "availabilityZoneId", "mapPublicIPOnLaunch", "assignIpv6AddressOnCreation", "ipv6CIDRBlock", "tags", "networkInterfaceId", "resourceType", "logFormat"]
+
+    # Generar import del schema original (necesario para tipos complejos)
+    import_path = str(input_filepath).replace(".k", "")
+    # Replace path separators with dots, but preserve the file structure
+    import_path = import_path.replace("/", ".")
+    path_parts = import_path.split(".")
+    if "modules" in path_parts:
+        modules_index = path_parts.index("modules")
+        import_path = ".".join(path_parts[modules_index:])
+    schema_alias = main_schema_name.lower() + "_schema"
+
+    if target_schema_body:
+        temp_params = {}
+        
+        # Buscar campos en los comentarios del docstring con el patrón: "campo : tipo, required/optional"
+        docstring_fields = re.findall(r"^\s*([a-zA-Z0-9_]+)\s*:\s*([^,]+),\s*(required|optional)", target_schema_body, re.MULTILINE)
+        
+        for attr_name, attr_type, requirement in docstring_fields:
+            # Limpiar el tipo
+            attr_type = attr_type.strip()
+            
+            # Skip campos inválidos o de metadatos
+            if (attr_name in ["Deprecated", "Default", "apiVersion", "kind", "metadata", "status", "true", "Constraints", "Maximum"] or 
+                attr_type in ["AWS", "Maximum of 1000 resources"] or
+                attr_name.startswith("_")):
+                continue
+                
+            is_required = (requirement == "required")
+            is_desirable = attr_name in desirable_optionals
+            
+
+            # Incluir todos los campos (tanto requeridos como opcionales)
+            if is_required or not is_required:  # Incluir todos los campos
+                param_name = f"_{attr_name}"
+                temp_params[param_name] = {"type": attr_type, "required": is_required}
+
+        # --- Fallback: Buscar campos directamente en el cuerpo del schema ---
+        code_only_body = re.sub(r'"""(.|\n)*?"""', '', target_schema_body)
+        body_fields = re.findall(r"^\s*([a-zA-Z0-9_]+)(\??)\s*:\s*(.+)", code_only_body, re.MULTILINE)
+        for attr_name, optional_marker, attr_type in body_fields:
+            param_name = f"_{attr_name}"
+            # No sobreescribir si ya fue encontrado en el docstring (más específico)
+            if param_name in temp_params or f"{param_name}?" in temp_params:
+                continue
+
+            # Limpiar el tipo y saltar comentarios
+            attr_type = attr_type.strip().split(" ")[0] # Tomar solo el tipo, ignorar comentarios
+            if attr_type.startswith("#"):
+                continue
+
+            # Skip campos inválidos o de metadatos
+            if (attr_name in ["Deprecated", "Default", "apiVersion", "kind", "metadata", "status"] or 
+                attr_type in ["AWS"] or
+                attr_name.startswith("_")):
+                continue
+
+            is_required = not bool(optional_marker)
+            is_desirable = attr_name in desirable_optionals
+
+            # Incluir todos los campos (tanto requeridos como opcionales)
+            if is_required or not is_required:  # Incluir todos los campos
+                # Asegurarse de que el tipo no sea una cadena vacía
+                if attr_type:
+                    temp_params[param_name] = {"type": attr_type, "required": is_required}
+        
+        # Convertir a formato KCL
+        for name, data in temp_params.items():
+            # Formato correcto: _name: str para requeridos, _name?: str para opcionales
+            param_name_kcl = name if data["required"] else f"{name}?"
+            type_name = data["type"]
+            
+            # Simplificar tipos complejos
+            if type_name.startswith("[") and "tagsitem" in type_name.lower():
+                type_name = "{str:str}"  # Simplificar solo arrays de tags
+            elif "|" in type_name and all(part.strip().startswith('"') and part.strip().endswith('"') for part in type_name.split("|")):
+                # Mantener union types de strings literales como están
+                pass  
+            elif type_name.startswith("[") and type_name.endswith("]"):
+                # Arrays complejos: agregar prefijo del schema al tipo interno
+                inner_type = type_name[1:-1]  # Remover [ ]
+                if inner_type not in ["str", "int", "bool"] and not inner_type.startswith("{"):
+                    type_name = f"[{schema_alias}.{inner_type}]"
+            elif not type_name in ["str", "int", "bool", "any"] and not type_name.startswith("[") and not type_name.startswith("{") and "|" not in type_name:
+                type_name = f"{schema_alias}.{type_name}"
+                
+            params_from_schema[param_name_kcl] = type_name
+
+    # Combinar parámetros del spec con los de forProvider
+    all_params = {}
+    
+    # Primero agregar parámetros del spec (excluyendo forProvider)
+    for name, data in spec_params.items():
+        param_name_kcl = name if data["required"] else f"{name}?"
+        type_name = data["type"]
+        
+        # Simplificar providerConfigRef a string para facilidad del usuario
+        if name.replace('_', '') == "providerConfigRef":
+            type_name = "str"
+        elif type_name.startswith("[") and type_name.endswith("]"):
+            # Arrays complejos:
+            inner_type = type_name[1:-1]  # Remover [ ]
+            # Check if inner_type is a union of string literals
+            is_string_union = "|" in inner_type and all(part.strip().startswith('"') and part.strip().endswith('"') for part in inner_type.split("|"))
+            
+            if not is_string_union and inner_type not in ["str", "int", "bool"] and not inner_type.startswith("{"):
+                 type_name = f"[{schema_alias}.{inner_type}]"
+        elif not type_name in ["str", "int", "bool", "any"] and not type_name.startswith("[") and not type_name.startswith("{") and "|" not in type_name:
+            type_name = f"{schema_alias}.{type_name}"
+            
+        all_params[param_name_kcl] = type_name
+    
+    # Luego agregar parámetros de forProvider
+    all_params.update(params_from_schema)
+
+    found_params = {"_name": "str", "_namespace?": "str", "_labels?": "{str:str}", "_annotations?": "{str:str}"}
+    
+    # Solo agregar _providerConfig si no existe _providerConfigRef en los parámetros del spec
+    has_provider_config_ref = any("providerConfigRef" in key.replace('?','')[1:] for key in all_params.keys())
+    if "providerConfigRef" in spec_schema_text and not has_provider_config_ref:
+        found_params["_providerConfig"] = "str"
+    
+    found_params.update(all_params)
+
+    params_definitions = "\n".join([f"    {name}: {stype}" for name, stype in found_params.items()])
+    
+    spec_mappings = []
+    for_provider_mappings = []
+    
+    # Separar campos del spec de los de forProvider
+    for name in all_params.keys():
+        field_name = name.replace('?','')[1:]  # Remove _ and ?
+        param_name = name.replace('?','')      # Remove ?
+        
+        # Verificar si el campo pertenece al spec principal o a forProvider
+        is_spec_field = field_name in [param.replace('_', '') for param in spec_params.keys()]
+        
+        if is_spec_field:
+            # Campo del spec principal
+            if field_name == "providerConfigRef":
+                # Manejar providerConfigRef como string que se convierte a objeto
+                spec_mappings.append(f'        {field_name} = {{"name": {param_name}}} if {param_name} else None')
+            elif field_name == "tags":
+                spec_mappings.append(f'        {field_name} = {param_name} if {param_name} else {{}}')
+            else:
+                spec_mappings.append(f'        {field_name} = {param_name}')
+        else:
+            # Campo de forProvider
+            # Special handling for tags: transform user-friendly map to list of objects if the schema requires it.
+            field_type_match = re.search(r"^\s*" + re.escape(field_name) + r"\??\s*:\s*(.+)", target_schema_body, re.MULTILINE)
+            original_type = ""
+            if field_type_match:
+                original_type = field_type_match.group(1).strip().split(" ")[0].rstrip(",")
+
+            if field_name == "tags":
+                if original_type.startswith("["):
+                    # Check if it's KMS-style tags (tagKey/tagValue) or standard tags (key/value)
+                    if "KeyspecforproviderTagsitem" in original_type or "tagKey" in target_schema_body:
+                        # KMS-style tags
+                        for_provider_mappings.append(f'            {field_name} = [{{"tagKey": k, "tagValue": v}} for k, v in {param_name}] if {param_name} else []')
+                    else:
+                        # Standard tags
+                        for_provider_mappings.append(f'            {field_name} = [{{"key": k, "value": v}} for k, v in {param_name}] if {param_name} else []')
+                elif original_type == "{str:str}":
+                    # Dictionary type tags (like in VPCEndpoint)
+                    for_provider_mappings.append(f'            {field_name} = {param_name} if {param_name} else {{}}')
+                else:
+                    # Default case
+                    for_provider_mappings.append(f'            {field_name} = {param_name}')
+            else:
+                for_provider_mappings.append(f'            {field_name} = {param_name}')
+    
+    spec_mappings_str = "\n".join(spec_mappings)
+    for_provider_mappings_str = "\n".join(for_provider_mappings)
+    
+    example_params = []
+    for name, kcl_type in found_params.items():
+        clean_name = name.replace('?','')
+        example_value = '"example-value"'
+        
+        if kcl_type == "bool": 
+            example_value = "True"
+        elif kcl_type == "int": 
+            example_value = "1"
+        elif kcl_type.startswith("["): 
+            example_value = "[]"
+        elif kcl_type == "{str:str}": 
+            example_value = '''{
+#             Name = "example-name"
+#             Environment = "development"
+#         }'''
+        elif kcl_type.startswith("{"):
+            example_value = "{:}"
+        elif "." in kcl_type:  # Complex types
+            if "ref" in kcl_type.lower():
+                example_value = '''{
+#             name = "example-resource-name"
+#         }'''
+            elif "selector" in kcl_type.lower():
+                example_value = '''{
+#             matchControllerRef = True
+#             # OR use matchLabels:
+#             # matchLabels = {
+#             #     key = "value"
+#             # }
+#         }'''
+            elif "Config" in kcl_type or "Spec" in kcl_type:
+                example_value = '''{
+#             # Add required fields here
+#         }'''
+            else:
+                example_value = '''{
+#             # Configure object fields as needed
+#         }'''
+                
+        example_params.append(f'#         {clean_name} = {example_value} # Reemplazar valor')
+    example_params_str = "\n".join(example_params)
+
+    spec_block = ""
+    
+    if is_crossplane_resource:
+        # Construir el contenido del spec
+        spec_content_parts = []
+        
+        # Agregar campos del spec principal (si existen)
+        if spec_mappings_str:
+            spec_content_parts.append(spec_mappings_str)
+        
+        # Agregar forProvider (si existe)
+        if for_provider_mappings_str:
+            for_provider_content = f"        forProvider = {{\n{for_provider_mappings_str}\n        }}"
+            spec_content_parts.append(for_provider_content)
+        
+        # Agregar providerConfigRef solo si no está ya incluido en spec_mappings
+        if "_providerConfig" in found_params and "providerConfigRef = _providerConfigRef" not in spec_mappings_str:
+            provider_config_block = "        providerConfigRef.name = _providerConfig"
+            spec_content_parts.append(provider_config_block)
+        
+        if spec_content_parts:
+            spec_content = "\n".join(spec_content_parts)
+            spec_block = f"\n    spec = {{\n{spec_content}\n    }}"
+    elif spec_mappings_str or for_provider_mappings_str:
+        # Para recursos no-Crossplane, usar todos los mappings directamente
+        all_mappings = []
+        if spec_mappings_str:
+            all_mappings.append(spec_mappings_str)
+        if for_provider_mappings_str:
+            all_mappings.append(for_provider_mappings_str)
+        
+        if all_mappings:
+            spec_content = "\n".join(all_mappings)
+            spec_block = f"\n    spec = {{\n{spec_content}\n    }}"
+
+    # Generar import del schema original
+    import_path = str(input_filepath).replace(".k", "")
+    # Replace path separators with dots, but preserve the file structure  
+    import_path = import_path.replace("/", ".")
+    # Remove leading path components until we find 'modules'
+    path_parts = import_path.split(".")
+    if "modules" in path_parts:
+        modules_index = path_parts.index("modules")
+        import_path = ".".join(path_parts[modules_index:])
+    import_statement = f"import {import_path} as {schema_alias}"
+
+    blueprint_code = f'''# --- Blueprint de Alto Nivel (Generado Automáticamente) ---
+
+{import_statement}
+
+schema {blueprint_name}({schema_alias}.{main_schema_name}):
+    """Este Blueprint simplifica la creación de un recurso {main_schema_name},
+    exponiendo una selección inteligente de campos requeridos y opcionales comunes."""
+
+    # Parámetros de entrada simplificados para el usuario
+{params_definitions}
+
+    # Lógica de mapeo de parámetros simples a la estructura compleja
+    metadata = {{
+        name = _name
+        namespace = _namespace
+        labels = _labels
+        annotations = _annotations
+    }}{spec_block}
+
+# --- Ejemplo de Uso ---
+# Descomenta y ajusta los valores para usar este Blueprint en tu archivo 'main.k'.
+# items = [
+#     {blueprint_name} {{
+{example_params_str}
+#     }}
+# ]
+'''
+    return blueprint_code, blueprint_name, main_schema_name
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Genera un Blueprint KCL a partir de un schema detallado.")
+    parser.add_argument("input_file", help="Ruta al archivo .k del schema KCL detallado.")
+    parser.add_argument("-o", "--output-file", help="Ruta completa del archivo .k de salida para el Blueprint.")
+    args = parser.parse_args()
+
+    input_filepath = Path(args.input_file)
+    
+    try:
+        with open(input_filepath, 'r', encoding='utf-8') as f:
+            detailed_schema_input = f.read()
+        print(f"✅ Archivo de entrada '{input_filepath}' leído.")
+    except FileNotFoundError:
+        print(f"❌ ERROR: No se encontró el archivo: {input_filepath}")
+        sys.exit(1)
+
+    print(f"\n--- Generando Blueprint Final para '{input_filepath.name}'... ---")
+    blueprint_code, blueprint_name, main_schema_name = generate_blueprint_from_schema(detailed_schema_input, input_filepath)
+    
+    if not blueprint_name:
+        print(f"❌ ERROR: No se pudo generar el blueprint.")
+        print(blueprint_code)
+        sys.exit(1)
+    
+    if args.output_file:
+        output_filepath = Path(args.output_file)
+        output_filepath.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            output_filepath.write_text(blueprint_code, encoding='utf-8')
+            print(f"\n✅ ¡Éxito! Blueprint guardado en: {output_filepath}")
+        except Exception as e:
+            print(f"❌ ERROR: No se pudo escribir el archivo de salida. {e}")
+            sys.exit(1)
+    else:
+        print("\n--- CÓDIGO DEL BLUEPRINT GENERADO ---")
+        print(blueprint_code)
